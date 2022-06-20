@@ -2,15 +2,24 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/loft-sh/vcluster/cmd/vclusterctl/cmd/app/localkubernetes"
 	"github.com/loft-sh/vcluster/cmd/vclusterctl/cmd/find"
 	"github.com/loft-sh/vcluster/cmd/vclusterctl/log/survey"
 	"github.com/loft-sh/vcluster/cmd/vclusterctl/log/terminal"
+	"io/ioutil"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer/yaml"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/clientcmd/api"
 )
 
 var (
@@ -55,7 +65,7 @@ type CreateCmd struct {
 	localCluster     bool
 	kubeClientConfig clientcmd.ClientConfig
 	kubeClient       *kubernetes.Clientset
-	rawConfig        clientcmdapi.Config
+	rawConfig        api.Config
 }
 
 // NewCreateCmd creates a new command
@@ -105,6 +115,8 @@ vcluster create test --namespace test
 	cobraCmd.Flags().BoolVar(&cmd.Connect, "connect", true, "If true will run vcluster connect directly after the vcluster was created")
 	cobraCmd.Flags().BoolVar(&cmd.Upgrade, "upgrade", false, "If true will try to upgrade the vcluster instead of failing if it already exists")
 	cobraCmd.Flags().BoolVar(&cmd.Isolate, "isolate", false, "If true vcluster and its workloads will run in an isolated environment")
+	cobraCmd.Flags().StringSliceVar(&cmd.Bootstrap, "bootstrap", []string{}, "List of manifests to bootstrap the vclsuter with")
+
 	return cobraCmd
 }
 
@@ -173,24 +185,140 @@ func (cmd *CreateCmd) Run(args []string) error {
 		return err
 	}
 
-	// check if we should connect to the vcluster
-	if cmd.Connect {
-		cmd.log.Donef("Successfully created virtual cluster %s in namespace %s", args[0], cmd.Namespace)
-		connectCmd := &ConnectCmd{
-			GlobalFlags:   cmd.GlobalFlags,
-			UpdateCurrent: true,
-			KubeConfig:    "./kubeconfig.yaml",
-			Log:           cmd.log,
-		}
-
-		return connectCmd.Connect(args[0], nil)
-	} else {
+	if len(cmd.Bootstrap) == 0 && !cmd.Connect {
 		if cmd.localCluster {
 			cmd.log.Donef("Successfully created virtual cluster %s in namespace %s. \n- Use 'vcluster connect %s --namespace %s' to access the virtual cluster", args[0], cmd.Namespace, args[0], cmd.Namespace)
 		} else {
 			cmd.log.Donef("Successfully created virtual cluster %s in namespace %s. \n- Use 'vcluster connect %s --namespace %s' to access the virtual cluster\n- Use `vcluster connect %s --namespace %s -- kubectl get ns` to run a command directly within the vcluster", args[0], cmd.Namespace, args[0], cmd.Namespace, args[0], cmd.Namespace)
 		}
+
+		return nil
 	}
+
+	connectCmd := &ConnectCmd{
+		GlobalFlags:   cmd.GlobalFlags,
+		UpdateCurrent: true,
+		KubeConfig:    "./kubeconfig.yaml",
+		Log:           cmd.log,
+	}
+
+	// check if we should connect to the vcluster
+	if cmd.Connect {
+		cmd.log.Donef("Successfully created virtual cluster %s in namespace %s", args[0], cmd.Namespace)
+		err = connectCmd.Connect(args[0], nil)
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(cmd.Bootstrap) > 0 {
+		cmd.log.Info("Bootstrap manifest(s) set, begin bootstrapping process")
+
+		if !cmd.Connect {
+			// did not connect, so we need to wait for vcluster to come up and get the config
+			err = connectCmd.prepare(args[0])
+			if err != nil {
+				return err
+			}
+
+			// this is kinda silly that it returns the vcluster raw config, but didn't want to
+			// change too much while messing with this.
+			connectCmd.vRawConfig, err = connectCmd.getVClusterKubeConfig(args[0], nil)
+			if err != nil {
+				return err
+			}
+		}
+
+		// should be set if we connected, but we can check anyway
+		if connectCmd.KubeConfigContextName == "" {
+			connectCmd.setContextName(args[0])
+		}
+
+		var rc *rest.Config
+
+		rc, err = RESTConfigFromAPIConfig(connectCmd.KubeConfigContextName, connectCmd.vRawConfig)
+		if err != nil {
+			return err
+		}
+
+		var dClient dynamic.Interface
+
+		dClient, err = dynamic.NewForConfig(rc)
+		if err != nil {
+			return errors.Wrap(err, "failed creating new dynamic client")
+		}
+
+		err = cmd.bootstrapDeploy(dClient)
+		if err != nil {
+			return err
+		}
+
+		cmd.log.Done("Successfully completed bootstrapping process")
+	}
+
+	return nil
+}
+
+func (cmd *CreateCmd) bootstrapDeploy(client dynamic.Interface) error {
+	groupResources, err := restmapper.GetAPIGroupResources(cmd.kubeClient.DiscoveryClient)
+	if err != nil {
+		return errors.Wrap(err, "failed creating new dynamic client")
+	}
+
+	mapper := restmapper.NewDiscoveryRESTMapper(groupResources)
+
+	serializer := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
+
+	// deploy all the provided manifests
+	for _, filename := range cmd.Bootstrap {
+		cmd.log.Infof("bootstrapping manifest '%s'", filename)
+
+		var b []byte
+
+		b, err = ioutil.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+
+		var gvk *schema.GroupVersionKind
+
+		obj := &unstructured.Unstructured{}
+
+		_, gvk, err = serializer.Decode(b, nil, obj)
+		if err != nil {
+			return errors.Wrap(err, fmt.Sprintf("failed decoding provided manifest file '%s'", filename))
+		}
+
+		var mapping *meta.RESTMapping
+
+		mapping, err = mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+		if err != nil {
+			return err
+		}
+
+		var ri dynamic.ResourceInterface
+
+		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+			ri = client.Resource(mapping.Resource).Namespace(obj.GetNamespace())
+		} else {
+			ri = client.Resource(mapping.Resource)
+		}
+
+		var j []byte
+
+		j, err = json.Marshal(obj)
+		if err != nil {
+			return nil
+		}
+
+		_, err = ri.Patch(context.Background(), obj.GetName(), types.ApplyPatchType, j, metav1.PatchOptions{
+			FieldManager: "vcluster",
+		})
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 

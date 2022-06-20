@@ -22,4 +22,5 @@ type CreateOptions struct {
 	Upgrade            bool
 	Isolate            bool
 	ReleaseValues      string
+	Bootstrap          []string
 }

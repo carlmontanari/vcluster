@@ -62,6 +62,7 @@ type ConnectCmd struct {
 	kubeClient       *kubernetes.Clientset
 	restConfig       *rest.Config
 	rawConfig        api.Config
+	vRawConfig       *api.Config
 
 	portForwarding bool
 	interruptChan  chan struct{}
@@ -137,18 +138,18 @@ func (cmd *ConnectCmd) Connect(vclusterName string, command []string) error {
 	}
 
 	// retrieve vcluster kube config
-	kubeConfig, err := cmd.getVClusterKubeConfig(vclusterName, command)
+	cmd.vRawConfig, err = cmd.getVClusterKubeConfig(vclusterName, command)
 	if err != nil {
 		return err
 	}
 
 	// check if we should execute command
 	if len(command) > 0 {
-		return cmd.executeCommand(*kubeConfig, command)
+		return cmd.executeCommand(*cmd.vRawConfig, command)
 	}
 
 	// write kube config to buffer
-	out, err := clientcmd.Write(*kubeConfig)
+	out, err := clientcmd.Write(*cmd.vRawConfig)
 	if err != nil {
 		return err
 	}
@@ -156,12 +157,12 @@ func (cmd *ConnectCmd) Connect(vclusterName string, command []string) error {
 	// write kube config to file
 	if cmd.UpdateCurrent {
 		var clusterConfig *api.Cluster
-		for _, c := range kubeConfig.Clusters {
+		for _, c := range cmd.vRawConfig.Clusters {
 			clusterConfig = c
 		}
 
 		var authConfig *api.AuthInfo
-		for _, a := range kubeConfig.AuthInfos {
+		for _, a := range cmd.vRawConfig.AuthInfos {
 			authConfig = a
 		}
 
@@ -418,6 +419,8 @@ func (cmd *ConnectCmd) getVClusterKubeConfig(vclusterName string, command []stri
 		}
 	}
 
+	cmd.vRawConfig = kubeConfig
+
 	return kubeConfig, nil
 }
 
@@ -475,13 +478,17 @@ func (cmd *ConnectCmd) setServerIfExposed(vClusterName string, vClusterConfig *a
 	return nil
 }
 
+func (cmd *ConnectCmd) setContextName(vclusterName string) {
+	if vclusterName != "" {
+		cmd.KubeConfigContextName = find.VClusterContextName(vclusterName, cmd.Namespace, cmd.rawConfig.CurrentContext)
+	} else {
+		cmd.KubeConfigContextName = find.VClusterContextName(cmd.PodName, cmd.Namespace, cmd.rawConfig.CurrentContext)
+	}
+}
+
 func (cmd *ConnectCmd) exchangeContextName(kubeConfig *api.Config, vclusterName string) error {
 	if cmd.KubeConfigContextName == "" {
-		if vclusterName != "" {
-			cmd.KubeConfigContextName = find.VClusterContextName(vclusterName, cmd.Namespace, cmd.rawConfig.CurrentContext)
-		} else {
-			cmd.KubeConfigContextName = find.VClusterContextName(cmd.PodName, cmd.Namespace, cmd.rawConfig.CurrentContext)
-		}
+		cmd.setContextName(vclusterName)
 	}
 
 	// update cluster

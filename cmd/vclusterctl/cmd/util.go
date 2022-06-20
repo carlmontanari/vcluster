@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 	"math/rand"
@@ -167,4 +168,37 @@ func checkPort(port int) (status bool, err error) {
 	// we successfully used and closed the port
 	// so it's now available to be used again
 	return true, nil
+}
+
+func RESTConfigFromAPIConfig(contextName string, config *api.Config) (*rest.Config, error) {
+	var clusterConfig *api.Cluster
+	var authConfig *api.AuthInfo
+
+	for _, c := range config.Clusters {
+		clusterConfig = c
+	}
+
+	for _, a := range config.AuthInfos {
+		authConfig = a
+	}
+
+	c := api.NewContext()
+	c.Cluster = contextName
+	c.AuthInfo = contextName
+
+	clientConfig := api.Config{
+		Kind:           "Config",
+		APIVersion:     "v1",
+		Clusters:       map[string]*api.Cluster{contextName: clusterConfig},
+		Contexts:       map[string]*api.Context{contextName: c},
+		CurrentContext: contextName,
+		AuthInfos:      map[string]*api.AuthInfo{contextName: authConfig},
+	}
+
+	configB, err := clientcmd.Write(clientConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return clientcmd.RESTConfigFromKubeConfig(configB)
 }
