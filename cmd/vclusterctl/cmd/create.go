@@ -1,12 +1,14 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"github.com/loft-sh/vcluster/cmd/vclusterctl/cmd/app/localkubernetes"
 	"github.com/loft-sh/vcluster/cmd/vclusterctl/cmd/find"
 	"github.com/loft-sh/vcluster/cmd/vclusterctl/log/survey"
 	"github.com/loft-sh/vcluster/cmd/vclusterctl/log/terminal"
+	"io/ioutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -105,6 +107,8 @@ vcluster create test --namespace test
 	cobraCmd.Flags().BoolVar(&cmd.Connect, "connect", true, "If true will run vcluster connect directly after the vcluster was created")
 	cobraCmd.Flags().BoolVar(&cmd.Upgrade, "upgrade", false, "If true will try to upgrade the vcluster instead of failing if it already exists")
 	cobraCmd.Flags().BoolVar(&cmd.Isolate, "isolate", false, "If true vcluster and its workloads will run in an isolated environment")
+	cobraCmd.Flags().StringSliceVar(&cmd.Init, "init", []string{}, "List of manifests to init(ialize) the vclsuter with")
+
 	return cobraCmd
 }
 
@@ -167,6 +171,17 @@ func (cmd *CreateCmd) Run(args []string) error {
 		}
 	}
 
+	if len(cmd.Init) > 0 {
+		var initValues string
+
+		initValues, err = cmd.setChartInitValues()
+		if err != nil {
+			return err
+		}
+
+		chartValues += initValues
+	}
+
 	// we have to upgrade / install the chart
 	err = cmd.deployChart(args[0], chartValues)
 	if err != nil {
@@ -192,6 +207,54 @@ func (cmd *CreateCmd) Run(args []string) error {
 		}
 	}
 	return nil
+}
+
+func (cmd *CreateCmd) setChartInitValues() (string, error) {
+	manifestValues := `
+init:
+  manifests: |-
+`
+
+	cmd.log.Info("Bootstrap manifest(s) set, adding to helm values")
+
+	for _, filename := range cmd.Init {
+		resolved := util.ResolveFile(filename)
+
+		if resolved == "" {
+			cmd.log.Errorf("Provided bootstrap file '%s' not found, skipping...", filename)
+
+			continue
+		}
+
+		b, err := ioutil.ReadFile(resolved)
+		if err != nil {
+			return "", err
+		}
+
+		// ensure each manifest has yaml start of document indicator
+		if !bytes.HasPrefix(b, []byte("---")) {
+			b = append([]byte("---"), b...)
+		}
+
+		var indentedB []byte
+
+		lineStart := true
+
+		// indent all lines four spaces for correctness in the rendered helm chart values
+		for _, c := range b {
+			if lineStart && c != '\n' {
+				indentedB = append(indentedB, []byte("    ")...)
+			}
+
+			indentedB = append(indentedB, c)
+
+			lineStart = c == '\n'
+		}
+
+		manifestValues += string(indentedB) + "\n"
+	}
+
+	return manifestValues, nil
 }
 
 func (cmd *CreateCmd) deployChart(vClusterName, chartValues string) error {

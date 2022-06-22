@@ -18,3 +18,13 @@ init:
     kind: ConfigMap
     ...
 ```
+
+Starting in version 0.10.2, vcluster cli also allows users to pass filenames of manifests that
+should be added to the vcluster helm chart values. These manifests will be deployed into the
+vcluster in the same way that they would when using helm. The `--init` flag is used to pass
+manifest filenames and can be used as follows:
+
+```
+vcluster create my-vcluster -n my-vcluster --init='/some/file/path/manifest.yaml,~/somemanifest.
+yaml'
+```
