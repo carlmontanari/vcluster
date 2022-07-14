@@ -78,13 +78,30 @@ func ListVClusters(context, name, namespace string) ([]VCluster, error) {
 		timeout = time.Second * 5
 	}
 
-	vclusters, err := findInContext(context, name, namespace, timeout)
+	kubeClientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(),
+		&clientcmd.ConfigOverrides{
+			CurrentContext: context,
+		},
+	)
+
+	restConfig, err := kubeClientConfig.ClientConfig()
+	if err != nil {
+		return nil, errors.Wrap(err, "load kube config")
+	}
+
+	client, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, errors.Wrap(err, "create kube client")
+	}
+
+	vclusters, err := findInContext(context, name, namespace, timeout, client, kubeClientConfig)
 	if err != nil && vClusterName == "" {
 		return nil, errors.Wrap(err, "find vcluster")
 	}
 
 	if vClusterName != "" {
-		parentContextVclusters, err := findInContext(vClusterContext, name, namespace, time.Minute)
+		parentContextVclusters, err := findInContext(vClusterContext, name, namespace, time.Minute, client, kubeClientConfig)
 		if err != nil {
 			return nil, errors.Wrap(err, "find vcluster")
 		}
@@ -112,19 +129,12 @@ func VClusterFromContext(originalContext string) (name string, namespace string,
 	return splitted[1], splitted[2], strings.Join(splitted[3:], "_")
 }
 
-func findInContext(context, name, namespace string, timeout time.Duration) ([]VCluster, error) {
-	kubeClientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{
-		CurrentContext: context,
-	})
-	restConfig, err := kubeClientConfig.ClientConfig()
-	if err != nil {
-		return nil, errors.Wrap(err, "load kube config")
-	}
-	client, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return nil, errors.Wrap(err, "create kube client")
-	}
-
+func findInContext(
+	context, name, namespace string,
+	timeout time.Duration,
+	client kubernetes.Interface,
+	kubeClientConfig clientcmd.ClientConfig,
+) ([]VCluster, error) {
 	// statefulset based vclusters
 	vclusters := []VCluster{}
 	statefulSets, err := getStatefulSets(client, namespace, kubeClientConfig, timeout)
@@ -139,9 +149,8 @@ func findInContext(context, name, namespace string, timeout time.Duration) ([]VC
 
 			var paused string
 
-			if p.Annotations != nil {
-				paused, _ = p.Annotations[constants.PausedAnnotation]
-			}
+			paused, _ = p.Annotations[constants.PausedAnnotation]
+
 			if p.Spec.Replicas != nil && *p.Spec.Replicas == 0 && paused != "true" {
 				// if the stateful set has been scaled down we'll ignore it -- this happens when
 				// using devspace to do vcluster plugin dev for example, devspace scales down the
@@ -185,7 +194,7 @@ func findInContext(context, name, namespace string, timeout time.Duration) ([]VC
 	return vclusters, nil
 }
 
-func getVCluster(object client.Object, context, release string, client *kubernetes.Clientset, kubeClientConfig clientcmd.ClientConfig) (VCluster, error) {
+func getVCluster(object client.Object, context, release string, client kubernetes.Interface, kubeClientConfig clientcmd.ClientConfig) (VCluster, error) {
 	namespace := object.GetNamespace()
 	created := object.GetCreationTimestamp().Time
 	releaseName := ""
@@ -219,7 +228,7 @@ func getVCluster(object client.Object, context, release string, client *kubernet
 	}, nil
 }
 
-func getPods(client *kubernetes.Clientset, kubeClientConfig clientcmd.ClientConfig, namespace, podSelector string) (*corev1.PodList, error) {
+func getPods(client kubernetes.Interface, kubeClientConfig clientcmd.ClientConfig, namespace, podSelector string) (*corev1.PodList, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
 
@@ -241,7 +250,7 @@ func getPods(client *kubernetes.Clientset, kubeClientConfig clientcmd.ClientConf
 	return podList, nil
 }
 
-func getDeployments(client *kubernetes.Clientset, namespace string, kubeClientConfig clientcmd.ClientConfig, timeout time.Duration) (*appsv1.DeploymentList, error) {
+func getDeployments(client kubernetes.Interface, namespace string, kubeClientConfig clientcmd.ClientConfig, timeout time.Duration) (*appsv1.DeploymentList, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -263,7 +272,7 @@ func getDeployments(client *kubernetes.Clientset, namespace string, kubeClientCo
 	return deploymentList, nil
 }
 
-func getStatefulSets(client *kubernetes.Clientset, namespace string, kubeClientConfig clientcmd.ClientConfig, timeout time.Duration) (*appsv1.StatefulSetList, error) {
+func getStatefulSets(client kubernetes.Interface, namespace string, kubeClientConfig clientcmd.ClientConfig, timeout time.Duration) (*appsv1.StatefulSetList, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
